@@ -55,6 +55,7 @@ Examples = collections.namedtuple("Examples", "paths, inputs, targets, count, st
 Model = collections.namedtuple("Model", "outputs, predict_real, predict_fake, discrim_loss, discrim_grads_and_vars, gen_loss_GAN, gen_loss_L1, gen_grads_and_vars, train")
 
 
+
 def preprocess(image):
     with tf.name_scope("preprocess"):
         # [0, 1] => [-1, 1]
@@ -425,6 +426,15 @@ def create_model(inputs, targets):
 
         return layers[-1]
 
+    def masked_l1_loss(inputs, outputs, targets):
+        mask = tf.to_float(inputs > -1)
+        outputs *= mask
+        targets *= mask
+        sum = tf.reduce_sum(tf.abs(targets - outputs))
+        return sum / tf.to_float(tf.math.count_nonzero(mask))
+
+
+
     with tf.variable_scope("generator"):
         out_channels = int(targets.get_shape()[-1])
         outputs = create_generator(inputs, out_channels)
@@ -451,7 +461,7 @@ def create_model(inputs, targets):
         # predict_fake => 1
         # abs(targets - outputs) => 0
         gen_loss_GAN = tf.reduce_mean(-tf.log(predict_fake + EPS))
-        gen_loss_L1 = tf.reduce_mean(tf.abs(targets - outputs))
+        gen_loss_L1 = masked_l1_loss(inputs, outputs, targets)
         gen_loss = gen_loss_GAN * a.gan_weight + gen_loss_L1 * a.l1_weight
 
     with tf.name_scope("discriminator_train"):
