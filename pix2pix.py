@@ -51,7 +51,7 @@ a = parser.parse_args()
 EPS = 1e-12
 CROP_SIZE = 256
 
-Examples = collections.namedtuple("Examples", "paths, inputs, targets, count, steps_per_epoch")
+Examples = collections.namedtuple("Examples", "paths, inputs, targets, count, steps_per_epoch, rotations")
 Model = collections.namedtuple("Model", "outputs, predict_real, predict_fake, discrim_loss, discrim_grads_and_vars, gen_loss_GAN, gen_loss_L1, gen_grads_and_vars, train")
 
 
@@ -231,13 +231,30 @@ def lab_to_rgb(lab):
 
 
 def load_examples():
+    def decode_rotation(csv):
+        splitted = tf.string_split([csv],"\n").values
+        splitted = tf.string_split(splitted, ",").values
+        reshaped = tf.reshape(splitted, (tf.size(splitted)/10, 10))
+        converted = tf.strings.to_number(reshaped, out_type=tf.float32)
+        filled = tf.concat((tf.zeros(shape=(1,10)), converted), axis=0)
+        return filled
+
+    def make_rotation_img(rot, seg):
+        def _make_rotation_img(rot,seg):
+            d = {r[0]:r[1:] for r in rot}
+            arr = [[d[p] for p in row] for row in seg[:,:,0]]
+            return np.array(arr)
+        func = tf.py_func(_make_rotation_img, [rot, seg], tf.float32)
+        func.set_shape((*(seg.get_shape()[:-1]),9))
+        return func
+
     if a.input_dir is None or not os.path.exists(a.input_dir):
         raise Exception("input_dir does not exist")
 
-    input_paths = glob.glob(os.path.join(a.input_dir, "*.jpg"))
+    input_paths = glob.glob(os.path.join(a.input_dir+"combined/", "*.jpg"))
     decode = tf.image.decode_jpeg
     if len(input_paths) == 0:
-        input_paths = glob.glob(os.path.join(a.input_dir, "*.png"))
+        input_paths = glob.glob(os.path.join(a.input_dir+"combined/", "*.png"))
         decode = tf.image.decode_png
 
     if len(input_paths) == 0:
@@ -255,8 +272,15 @@ def load_examples():
         input_paths = sorted(input_paths)
 
     with tf.name_scope("load_images"):
-        path_queue = tf.train.string_input_producer(input_paths, shuffle=a.mode == "train")
+        if a.mode == "train":
+            random.shuffle(input_paths)
+        rot_input_paths = [a.input_dir+"rotation/"+get_name(path)+".csv" for path in input_paths]
+
+        path_queue = tf.train.string_input_producer(input_paths, shuffle=False)
+        rot_path_queue = tf.train.string_input_producer(rot_input_paths, shuffle=False)
         reader = tf.WholeFileReader()
+        _, csv = reader.read(rot_path_queue)
+        raw_rot = decode_rotation(csv)
         paths, contents = reader.read(path_queue)
         raw_input = decode(contents)
         raw_input = tf.image.convert_image_dtype(raw_input, dtype=tf.float32)
@@ -279,12 +303,16 @@ def load_examples():
             a_images = preprocess(raw_input[:,:width//2,:])
             b_images = preprocess(raw_input[:,width//2:,:])
 
+
     if a.which_direction == "AtoB":
         inputs, targets = [a_images, b_images]
     elif a.which_direction == "BtoA":
         inputs, targets = [b_images, a_images]
     else:
         raise Exception("invalid direction")
+
+    rotations = make_rotation_img(raw_rot, tf.round((inputs+1)*128))
+    combined = tf.concat((inputs, rotations), axis=-1)
 
     # synchronize seed for image operations so that we do the same operations to both
     # input and output images
@@ -305,27 +333,35 @@ def load_examples():
             raise Exception("scale size cannot be less than crop size")
         return r
 
+    input_combined = transform(combined)
     with tf.name_scope("input_images"):
-        input_images = transform(inputs)
+        input_images = tf.slice(input_combined, [0,0,0],[-1,-1,3])
+
+    with tf.name_scope("input_rotations"):
+        input_rotations = tf.slice(input_combined, [0,0,3], [-1,-1,-1])
 
     with tf.name_scope("target_images"):
         target_images = transform(targets)
 
-    paths_batch, inputs_batch, targets_batch = tf.train.batch([paths, input_images, target_images], batch_size=a.batch_size)
+
+    paths_batch, inputs_batch, targets_batch, rotations_batch = tf.train.batch([paths, input_images, target_images, input_rotations], batch_size=a.batch_size)
     steps_per_epoch = int(math.ceil(len(input_paths) / a.batch_size))
 
     return Examples(
         paths=paths_batch,
         inputs=inputs_batch,
         targets=targets_batch,
+        rotations=rotations_batch,
         count=len(input_paths),
         steps_per_epoch=steps_per_epoch,
     )
 
 
-def create_generator(generator_inputs, generator_outputs_channels):
+def create_generator(generator_inputs, rotations, generator_outputs_channels):
     layers = []
 
+    with tf.variable_scope("bundling"):
+        generator_inputs = tf.concat((generator_inputs, rotations), axis=-1)
     # encoder_1: [batch, 256, 256, in_channels] => [batch, 128, 128, ngf]
     with tf.variable_scope("encoder_1"):
         output = gen_conv(generator_inputs, a.ngf)
@@ -391,7 +427,7 @@ def create_generator(generator_inputs, generator_outputs_channels):
     return layers[-1]
 
 
-def create_model(inputs, targets):
+def create_model(inputs, targets, rotations):
     def create_discriminator(discrim_inputs, discrim_targets):
         n_layers = 3
         layers = []
@@ -427,7 +463,7 @@ def create_model(inputs, targets):
 
     with tf.variable_scope("generator"):
         out_channels = int(targets.get_shape()[-1])
-        outputs = create_generator(inputs, out_channels)
+        outputs = create_generator(inputs, rotations, out_channels)
 
     # create two copies of discriminator, one for real pairs and one for fake pairs
     # they share the same underlying variables
@@ -626,7 +662,7 @@ def main():
     print("examples count = %d" % examples.count)
 
     # inputs and targets are [batch_size, height, width, channels]
-    model = create_model(examples.inputs, examples.targets)
+    model = create_model(examples.inputs, examples.targets, examples.rotations)
 
     # undo colorization splitting on images that we use for display/output
     if a.lab_colorization:
