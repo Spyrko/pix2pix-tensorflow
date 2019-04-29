@@ -44,6 +44,14 @@ parser.add_argument("--beta1", type=float, default=0.5, help="momentum term of a
 parser.add_argument("--l1_weight", type=float, default=100.0, help="weight on L1 term for generator gradient")
 parser.add_argument("--gan_weight", type=float, default=1.0, help="weight on GAN term for generator gradient")
 
+parser.add_argument("--masked_l1", action="store_true")
+parser.add_argument("--use_rotation", action="store_true")
+parser.add_argument("--deterministic", action="store_true")
+parser.add_argument("--spade", action="store_true")
+parser.add_argument("--gpu")
+parser.add_argument("--cpu")
+
+
 # export options
 parser.add_argument("--output_filetype", default="png", choices=["png", "jpeg"])
 a = parser.parse_args()
@@ -53,8 +61,10 @@ CROP_SIZE = 256
 
 Examples = collections.namedtuple("Examples", "paths, inputs, targets, count, steps_per_epoch, rotations")
 Model = collections.namedtuple("Model", "outputs, predict_real, predict_fake, discrim_loss, discrim_grads_and_vars, gen_loss_GAN, gen_loss_L1, gen_grads_and_vars, train")
-
-
+if not a.gpu is None:
+    os.environ["CUDA_VISIBLE_DEVICES"] = a.gpu
+if not a.cpu is None:
+    os.system("taskset -pc %s %s" % (a.cpu, os.getpid()))
 
 def preprocess(image):
     with tf.name_scope("preprocess"):
@@ -131,6 +141,21 @@ def lrelu(x, a):
 
 def batchnorm(inputs):
     return tf.layers.batch_normalization(inputs, axis=3, epsilon=1e-5, momentum=0.1, training=True, gamma_initializer=tf.random_normal_initializer(1.0, 0.02))
+
+
+def spade(x, segmap, norm=batchnorm):
+    initializer = tf.random_normal_initializer(0, 0.02)
+    ks = 4
+    # implementation taken from https://github.com/NVlabs/SPADE/blob/master/models/networks/normalization.py
+    normalized = norm(x)
+    segmap = tf.image.resize_nearest_neighbor(segmap, x.shape)
+    actv = tf.layers.conv2d(segmap, 128, kernel_size=ks, kernel_initializer=initializer)
+    actv = tf.nn.relu(actv)
+    gamma = tf.layers.conv2d(actv, normalized.shape[-1], kernel_size=ks, kernel_initializer=initializer)
+    beta = tf.layers.conv2d(actv, normalized.shape[-1], kernel_size=ks, kernel_initializer=initializer)
+    out = normalized * (1+gamma) + beta
+    return out
+
 
 
 def check_image(image):
@@ -280,8 +305,6 @@ def load_examples():
         path_queue = tf.train.string_input_producer(input_paths, shuffle=False)
         rot_path_queue = tf.train.string_input_producer(rot_input_paths, shuffle=False)
         reader = tf.WholeFileReader()
-        _, csv = reader.read(rot_path_queue)
-        raw_rot = decode_rotation(csv)
         paths, contents = reader.read(path_queue)
         raw_input = decode(contents)
         raw_input = tf.image.convert_image_dtype(raw_input, dtype=tf.float32)
@@ -312,9 +335,6 @@ def load_examples():
     else:
         raise Exception("invalid direction")
 
-    rotations = make_rotation_img(raw_rot, tf.round((inputs+1)*128))
-    combined = tf.concat((inputs, rotations), axis=-1)
-
     # synchronize seed for image operations so that we do the same operations to both
     # input and output images
     seed = random.randint(0, 2**31 - 1)
@@ -334,18 +354,29 @@ def load_examples():
             raise Exception("scale size cannot be less than crop size")
         return r
 
-    input_combined = transform(combined)
-    with tf.name_scope("input_images"):
-        input_images = tf.slice(input_combined, [0,0,0],[-1,-1,3])
-
-    with tf.name_scope("input_rotations"):
-        input_rotations = tf.slice(input_combined, [0,0,3], [-1,-1,-1])
-
     with tf.name_scope("target_images"):
         target_images = transform(targets)
 
+    if a.use_rotation:
+        _, csv = reader.read(rot_path_queue)
+        raw_rot = decode_rotation(csv)
+        rotations = make_rotation_img(raw_rot, tf.round((inputs + 1) * 128))
+        combined = tf.concat((inputs, rotations), axis=-1)
+        input_combined = transform(combined)
+        with tf.name_scope("input_images"):
+            input_images = tf.slice(input_combined, [0,0,0],[-1,-1,3])
 
-    paths_batch, inputs_batch, targets_batch, rotations_batch = tf.train.batch([paths, input_images, target_images, input_rotations], batch_size=a.batch_size)
+        with tf.name_scope("input_rotations"):
+            input_rotations = tf.slice(input_combined, [0,0,3], [-1,-1,-1])
+        paths_batch, inputs_batch, targets_batch, rotations_batch = tf.train.batch(
+            [paths, input_images, target_images, input_rotations], batch_size=a.batch_size)
+    else:
+        with tf.name_scope("input_images"):
+            input_images = transform(inputs)
+        paths_batch, inputs_batch, targets_batch = tf.train.batch(
+            [paths, input_images, target_images], batch_size=a.batch_size)
+        rotations_batch = None
+
     steps_per_epoch = int(math.ceil(len(input_paths) / a.batch_size))
 
     return Examples(
@@ -359,10 +390,18 @@ def load_examples():
 
 
 def create_generator(generator_inputs, rotations, generator_outputs_channels):
+    if a.spade:
+        return create_generator_patchgan_spade(generator_inputs, rotations, generator_outputs_channels)
+    else:
+        return create_generator_patchgan(generator_inputs, rotations, generator_outputs_channels)
+
+
+def create_generator_patchgan(generator_inputs, rotations, generator_outputs_channels):
     layers = []
 
-    with tf.variable_scope("bundling"):
-        generator_inputs = tf.concat((generator_inputs, rotations), axis=-1)
+    if a.use_rotation:
+        with tf.variable_scope("bundling"):
+            generator_inputs = tf.concat((generator_inputs, rotations), axis=-1)
     # encoder_1: [batch, 256, 256, in_channels] => [batch, 128, 128, ngf]
     with tf.variable_scope("encoder_1"):
         output = gen_conv(generator_inputs, a.ngf)
@@ -428,6 +467,83 @@ def create_generator(generator_inputs, rotations, generator_outputs_channels):
     return layers[-1]
 
 
+def create_generator_patchgan_spade(generator_inputs, rotations, generator_outputs_channels, noise=None):
+    z_dim = 10
+    layers = []
+
+    segmap = generator_inputs
+    if a.use_rotation:
+        with tf.variable_scope("bundling"):
+            segmap = tf.concat((generator_inputs, rotations), axis=-1)
+    if noise is None:
+        noise = tf.random_normal(z_dim)
+    noise = tf.layers.dense(noise, generator_inputs.size())
+    generator_inputs = tf.reshape(noise, generator_inputs.shape)
+    # encoder_1: [batch, 256, 256, in_channels] => [batch, 128, 128, ngf]
+    with tf.variable_scope("encoder_1"):
+        output = gen_conv(generator_inputs, a.ngf)
+        layers.append(output)
+
+    layer_specs = [
+        a.ngf * 2, # encoder_2: [batch, 128, 128, ngf] => [batch, 64, 64, ngf * 2]
+        a.ngf * 4, # encoder_3: [batch, 64, 64, ngf * 2] => [batch, 32, 32, ngf * 4]
+        a.ngf * 8, # encoder_4: [batch, 32, 32, ngf * 4] => [batch, 16, 16, ngf * 8]
+        a.ngf * 8, # encoder_5: [batch, 16, 16, ngf * 8] => [batch, 8, 8, ngf * 8]
+        a.ngf * 8, # encoder_6: [batch, 8, 8, ngf * 8] => [batch, 4, 4, ngf * 8]
+        a.ngf * 8, # encoder_7: [batch, 4, 4, ngf * 8] => [batch, 2, 2, ngf * 8]
+        a.ngf * 8, # encoder_8: [batch, 2, 2, ngf * 8] => [batch, 1, 1, ngf * 8]
+    ]
+
+    for out_channels in layer_specs:
+        with tf.variable_scope("encoder_%d" % (len(layers) + 1)):
+            rectified = lrelu(layers[-1], 0.2)
+            # [batch, in_height, in_width, in_channels] => [batch, in_height/2, in_width/2, out_channels]
+            convolved = gen_conv(rectified, out_channels)
+            output = spade(convolved, segmap)
+            layers.append(output)
+
+    layer_specs = [
+        (a.ngf * 8, 0.5),   # decoder_8: [batch, 1, 1, ngf * 8] => [batch, 2, 2, ngf * 8 * 2]
+        (a.ngf * 8, 0.5),   # decoder_7: [batch, 2, 2, ngf * 8 * 2] => [batch, 4, 4, ngf * 8 * 2]
+        (a.ngf * 8, 0.5),   # decoder_6: [batch, 4, 4, ngf * 8 * 2] => [batch, 8, 8, ngf * 8 * 2]
+        (a.ngf * 8, 0.0),   # decoder_5: [batch, 8, 8, ngf * 8 * 2] => [batch, 16, 16, ngf * 8 * 2]
+        (a.ngf * 4, 0.0),   # decoder_4: [batch, 16, 16, ngf * 8 * 2] => [batch, 32, 32, ngf * 4 * 2]
+        (a.ngf * 2, 0.0),   # decoder_3: [batch, 32, 32, ngf * 4 * 2] => [batch, 64, 64, ngf * 2 * 2]
+        (a.ngf, 0.0),       # decoder_2: [batch, 64, 64, ngf * 2 * 2] => [batch, 128, 128, ngf * 2]
+    ]
+
+    num_encoder_layers = len(layers)
+    for decoder_layer, (out_channels, dropout) in enumerate(layer_specs):
+        skip_layer = num_encoder_layers - decoder_layer - 1
+        with tf.variable_scope("decoder_%d" % (skip_layer + 1)):
+            if decoder_layer == 0:
+                # first decoder layer doesn't have skip connections
+                # since it is directly connected to the skip_layer
+                input = layers[-1]
+            else:
+                input = tf.concat([layers[-1], layers[skip_layer]], axis=3)
+
+            rectified = tf.nn.relu(input)
+            # [batch, in_height, in_width, in_channels] => [batch, in_height*2, in_width*2, out_channels]
+            output = gen_deconv(rectified, out_channels)
+            output = spade(output, segmap)
+
+            if dropout > 0.0:
+                output = tf.nn.dropout(output, keep_prob=1 - dropout)
+
+            layers.append(output)
+
+    # decoder_1: [batch, 128, 128, ngf * 2] => [batch, 256, 256, generator_outputs_channels]
+    with tf.variable_scope("decoder_1"):
+        input = tf.concat([layers[-1], layers[0]], axis=3)
+        rectified = tf.nn.relu(input)
+        output = gen_deconv(rectified, generator_outputs_channels)
+        output = tf.tanh(output)
+        layers.append(output)
+
+    return layers[-1]
+
+
 def create_model(inputs, targets, rotations):
     def create_discriminator(discrim_inputs, discrim_targets):
         n_layers = 3
@@ -463,6 +579,8 @@ def create_model(inputs, targets, rotations):
         return layers[-1]
 
     def masked_l1_loss(inputs, outputs, targets):
+        if not a.masked_l1:
+            return tf.reduce_mean(tf.abs(targets - outputs))
         mask = tf.to_float(inputs > -1)
         outputs *= mask
         targets *= mask
