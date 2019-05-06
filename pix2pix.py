@@ -48,6 +48,7 @@ parser.add_argument("--masked_l1", action="store_true")
 parser.add_argument("--use_rotation", action="store_true")
 parser.add_argument("--deterministic", action="store_true")
 parser.add_argument("--spade", action="store_true")
+parser.add_argument("--one_hot", action="store_true")
 parser.add_argument("--gpu")
 parser.add_argument("--cpu")
 
@@ -143,17 +144,25 @@ def batchnorm(inputs):
     return tf.layers.batch_normalization(inputs, axis=3, epsilon=1e-5, momentum=0.1, training=True, gamma_initializer=tf.random_normal_initializer(1.0, 0.02))
 
 
+def normalize(x, segmap, norm=batchnorm):
+    if a.spade:
+        return spade(x, segmap, norm)
+    else:
+        return norm(x)
+
+
 def spade(x, segmap, norm=batchnorm):
-    initializer = tf.random_normal_initializer(0, 0.02)
-    ks = 4
-    # implementation taken from https://github.com/NVlabs/SPADE/blob/master/models/networks/normalization.py
-    normalized = norm(x)
-    segmap = tf.image.resize_nearest_neighbor(segmap, x.shape)
-    actv = tf.layers.conv2d(segmap, 128, kernel_size=ks, kernel_initializer=initializer)
-    actv = tf.nn.relu(actv)
-    gamma = tf.layers.conv2d(actv, normalized.shape[-1], kernel_size=ks, kernel_initializer=initializer)
-    beta = tf.layers.conv2d(actv, normalized.shape[-1], kernel_size=ks, kernel_initializer=initializer)
-    out = normalized * (1+gamma) + beta
+    with tf.name_scope("spade"):
+        initializer = tf.random_normal_initializer(0, 0.02)
+        ks = 4
+        # implementation taken from https://github.com/NVlabs/SPADE/blob/master/models/networks/normalization.py
+        normalized = norm(x)
+        segmap = tf.image.resize_nearest_neighbor(segmap, x.shape[1:-1])
+        actv = tf.layers.conv2d(segmap, 128, kernel_size=ks, kernel_initializer=initializer, padding="same")
+        actv = tf.nn.relu(actv)
+        gamma = tf.layers.conv2d(actv, normalized.shape[-1], kernel_size=ks, kernel_initializer=initializer, padding="same")
+        beta = tf.layers.conv2d(actv, normalized.shape[-1], kernel_size=ks, kernel_initializer=initializer, padding="same")
+        out = normalized * (1+gamma) + beta
     return out
 
 
@@ -338,14 +347,14 @@ def load_examples():
     # synchronize seed for image operations so that we do the same operations to both
     # input and output images
     seed = random.randint(0, 2**31 - 1)
-    def transform(image):
+    def transform(image, resize_method=tf.image.ResizeMethod.AREA):
         r = image
         if a.flip:
             r = tf.image.random_flip_left_right(r, seed=seed)
 
         # area produces a nice downscaling, but does nearest neighbor for upscaling
         # assume we're going to be doing downscaling here
-        r = tf.image.resize_images(r, [a.scale_size, a.scale_size], method=tf.image.ResizeMethod.AREA)
+        r = tf.image.resize_images(r, [a.scale_size, a.scale_size], method=resize_method)
 
         offset = tf.cast(tf.floor(tf.random_uniform([2], 0, a.scale_size - CROP_SIZE + 1, seed=seed)), dtype=tf.int32)
         if a.scale_size > CROP_SIZE:
@@ -362,7 +371,7 @@ def load_examples():
         raw_rot = decode_rotation(csv)
         rotations = make_rotation_img(raw_rot, tf.round((inputs + 1) * 128))
         combined = tf.concat((inputs, rotations), axis=-1)
-        input_combined = transform(combined)
+        input_combined = transform(combined, resize_method=tf.image.ResizeMethod.NEAREST_NEIGHBOR)
         with tf.name_scope("input_images"):
             input_images = tf.slice(input_combined, [0,0,0],[-1,-1,3])
 
@@ -370,9 +379,10 @@ def load_examples():
             input_rotations = tf.slice(input_combined, [0,0,3], [-1,-1,-1])
         paths_batch, inputs_batch, targets_batch, rotations_batch = tf.train.batch(
             [paths, input_images, target_images, input_rotations], batch_size=a.batch_size)
+
     else:
         with tf.name_scope("input_images"):
-            input_images = transform(inputs)
+            input_images = transform(inputs, resize_method=tf.image.ResizeMethod.NEAREST_NEIGHBOR)
         paths_batch, inputs_batch, targets_batch = tf.train.batch(
             [paths, input_images, target_images], batch_size=a.batch_size)
         rotations_batch = None
@@ -390,84 +400,13 @@ def load_examples():
 
 
 def create_generator(generator_inputs, rotations, generator_outputs_channels):
-    if a.spade:
-        return create_generator_patchgan_spade(generator_inputs, rotations, generator_outputs_channels)
-    else:
-        return create_generator_patchgan(generator_inputs, rotations, generator_outputs_channels)
+    if a.one_hot:
+        generator_inputs = tf.one_hot(tf.cast(tf.round((generator_inputs[:, :, :, 0]+1)*127.5), tf.uint8), 22)
+
+    return create_generator_patchgan(generator_inputs, rotations, generator_outputs_channels)
 
 
-def create_generator_patchgan(generator_inputs, rotations, generator_outputs_channels):
-    layers = []
-
-    if a.use_rotation:
-        with tf.variable_scope("bundling"):
-            generator_inputs = tf.concat((generator_inputs, rotations), axis=-1)
-    # encoder_1: [batch, 256, 256, in_channels] => [batch, 128, 128, ngf]
-    with tf.variable_scope("encoder_1"):
-        output = gen_conv(generator_inputs, a.ngf)
-        layers.append(output)
-
-    layer_specs = [
-        a.ngf * 2, # encoder_2: [batch, 128, 128, ngf] => [batch, 64, 64, ngf * 2]
-        a.ngf * 4, # encoder_3: [batch, 64, 64, ngf * 2] => [batch, 32, 32, ngf * 4]
-        a.ngf * 8, # encoder_4: [batch, 32, 32, ngf * 4] => [batch, 16, 16, ngf * 8]
-        a.ngf * 8, # encoder_5: [batch, 16, 16, ngf * 8] => [batch, 8, 8, ngf * 8]
-        a.ngf * 8, # encoder_6: [batch, 8, 8, ngf * 8] => [batch, 4, 4, ngf * 8]
-        a.ngf * 8, # encoder_7: [batch, 4, 4, ngf * 8] => [batch, 2, 2, ngf * 8]
-        a.ngf * 8, # encoder_8: [batch, 2, 2, ngf * 8] => [batch, 1, 1, ngf * 8]
-    ]
-
-    for out_channels in layer_specs:
-        with tf.variable_scope("encoder_%d" % (len(layers) + 1)):
-            rectified = lrelu(layers[-1], 0.2)
-            # [batch, in_height, in_width, in_channels] => [batch, in_height/2, in_width/2, out_channels]
-            convolved = gen_conv(rectified, out_channels)
-            output = batchnorm(convolved)
-            layers.append(output)
-
-    layer_specs = [
-        (a.ngf * 8, 0.5),   # decoder_8: [batch, 1, 1, ngf * 8] => [batch, 2, 2, ngf * 8 * 2]
-        (a.ngf * 8, 0.5),   # decoder_7: [batch, 2, 2, ngf * 8 * 2] => [batch, 4, 4, ngf * 8 * 2]
-        (a.ngf * 8, 0.5),   # decoder_6: [batch, 4, 4, ngf * 8 * 2] => [batch, 8, 8, ngf * 8 * 2]
-        (a.ngf * 8, 0.0),   # decoder_5: [batch, 8, 8, ngf * 8 * 2] => [batch, 16, 16, ngf * 8 * 2]
-        (a.ngf * 4, 0.0),   # decoder_4: [batch, 16, 16, ngf * 8 * 2] => [batch, 32, 32, ngf * 4 * 2]
-        (a.ngf * 2, 0.0),   # decoder_3: [batch, 32, 32, ngf * 4 * 2] => [batch, 64, 64, ngf * 2 * 2]
-        (a.ngf, 0.0),       # decoder_2: [batch, 64, 64, ngf * 2 * 2] => [batch, 128, 128, ngf * 2]
-    ]
-
-    num_encoder_layers = len(layers)
-    for decoder_layer, (out_channels, dropout) in enumerate(layer_specs):
-        skip_layer = num_encoder_layers - decoder_layer - 1
-        with tf.variable_scope("decoder_%d" % (skip_layer + 1)):
-            if decoder_layer == 0:
-                # first decoder layer doesn't have skip connections
-                # since it is directly connected to the skip_layer
-                input = layers[-1]
-            else:
-                input = tf.concat([layers[-1], layers[skip_layer]], axis=3)
-
-            rectified = tf.nn.relu(input)
-            # [batch, in_height, in_width, in_channels] => [batch, in_height*2, in_width*2, out_channels]
-            output = gen_deconv(rectified, out_channels)
-            output = batchnorm(output)
-
-            if dropout > 0.0:
-                output = tf.nn.dropout(output, keep_prob=1 - dropout)
-
-            layers.append(output)
-
-    # decoder_1: [batch, 128, 128, ngf * 2] => [batch, 256, 256, generator_outputs_channels]
-    with tf.variable_scope("decoder_1"):
-        input = tf.concat([layers[-1], layers[0]], axis=3)
-        rectified = tf.nn.relu(input)
-        output = gen_deconv(rectified, generator_outputs_channels)
-        output = tf.tanh(output)
-        layers.append(output)
-
-    return layers[-1]
-
-
-def create_generator_patchgan_spade(generator_inputs, rotations, generator_outputs_channels, noise=None):
+def create_generator_patchgan(generator_inputs, rotations, generator_outputs_channels, noise=None):
     z_dim = 10
     layers = []
 
@@ -475,10 +414,11 @@ def create_generator_patchgan_spade(generator_inputs, rotations, generator_outpu
     if a.use_rotation:
         with tf.variable_scope("bundling"):
             segmap = tf.concat((generator_inputs, rotations), axis=-1)
-    if noise is None:
-        noise = tf.random_normal(z_dim)
-    noise = tf.layers.dense(noise, generator_inputs.size())
-    generator_inputs = tf.reshape(noise, generator_inputs.shape)
+    if a.spade:
+        if noise is None:
+            noise = tf.random_normal((generator_inputs.shape[0].value,z_dim))
+        noise = tf.layers.dense(noise, np.product(generator_inputs.shape))
+        generator_inputs = tf.reshape(noise, generator_inputs.shape)
     # encoder_1: [batch, 256, 256, in_channels] => [batch, 128, 128, ngf]
     with tf.variable_scope("encoder_1"):
         output = gen_conv(generator_inputs, a.ngf)
@@ -499,7 +439,7 @@ def create_generator_patchgan_spade(generator_inputs, rotations, generator_outpu
             rectified = lrelu(layers[-1], 0.2)
             # [batch, in_height, in_width, in_channels] => [batch, in_height/2, in_width/2, out_channels]
             convolved = gen_conv(rectified, out_channels)
-            output = spade(convolved, segmap)
+            output = normalize(convolved, segmap)
             layers.append(output)
 
     layer_specs = [
@@ -526,7 +466,7 @@ def create_generator_patchgan_spade(generator_inputs, rotations, generator_outpu
             rectified = tf.nn.relu(input)
             # [batch, in_height, in_width, in_channels] => [batch, in_height*2, in_width*2, out_channels]
             output = gen_deconv(rectified, out_channels)
-            output = spade(output, segmap)
+            output = normalize(output, segmap)
 
             if dropout > 0.0:
                 output = tf.nn.dropout(output, keep_prob=1 - dropout)
@@ -697,6 +637,24 @@ def append_index(filesets, step=False):
     return index_path
 
 
+def generate_out_dir():
+    base = True
+    if a.one_hot:
+        base=False
+        a.output_dir += "_onehot"
+    if a.spade:
+        base=False
+        a.output_dir += "_spade"
+    if a.masked_l1:
+        base=False
+        a.output_dir += "_masked"
+    if a.use_rotation:
+        base=False
+        a.output_dir += "_rotation"
+    if base:
+        a.output_dir += "_base"
+
+
 def main():
     if a.seed is None:
         a.seed = random.randint(0, 2**31 - 1)
@@ -704,6 +662,8 @@ def main():
     tf.set_random_seed(a.seed)
     np.random.seed(a.seed)
     random.seed(a.seed)
+
+    generate_out_dir()
 
     if not os.path.exists(a.output_dir):
         os.makedirs(a.output_dir)
